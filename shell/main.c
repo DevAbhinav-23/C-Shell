@@ -57,8 +57,8 @@ static int exec_atomic(const AtomicCmd *a)
         return builtin_log(a->args, a->arg_count);
     else {
         /* Non-builtin: cannot exec* (Part C will handle) */
-        fprintf(stderr, "%s: command not found\n", a->name);
-        return 1;
+        /* Silently ignore -- exec* is banned until Part C */
+        return 0;
     }
 }
 

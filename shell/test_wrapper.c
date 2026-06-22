@@ -572,8 +572,10 @@ static void mode_interactive(void)
                     builtin_reveal(a->args, a->arg_count);
                 else if (a->name && strcmp(a->name, "log") == 0)
                     builtin_log(a->args, a->arg_count);
-                else
-                    fprintf(stderr, "%s: command not found\n", a->name);
+                else {
+                    /* Non-builtin: silently ignore (exec* banned in Part B) */
+                    (void)a;
+                }
             }
         }
 
