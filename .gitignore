@@ -1,0 +1,4 @@
+*.o
+shell.out
+test.out
+test_debug.out
