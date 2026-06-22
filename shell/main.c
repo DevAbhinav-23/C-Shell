@@ -1,8 +1,8 @@
 /*
- * main.c  --  Shell entry point
+ * main.c  --  Shell entry point (Parts A + B)
  *
- * The REPL loop: prompt -> read -> parse -> print error if invalid.
- * Part A does not execute commands, so only syntax validation is done.
+ * The REPL loop: prompt -> read -> parse -> dispatch.
+ * Builtin commands (hop, reveal, log) are handled internally.
  */
 #include "shell.h"
 #include "prompt.h"
@@ -14,7 +14,7 @@
 ShellState g_shell;
 
 /* ------------------------------------------------------------------ */
-/*  Initialise shell state (set home to cwd at startup)                */
+/*  Initialise shell state                                             */
 /* ------------------------------------------------------------------ */
 static void shell_init(void)
 {
@@ -22,6 +22,71 @@ static void shell_init(void)
         perror("getcwd");
         strcpy(g_shell.home_dir, ".");
     }
+    g_shell.prev_cwd[0] = '\0';
+    g_shell.has_prev_cwd = 0;
+
+    /* Initialise the log / history subsystem */
+    log_init();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Check if a command name is "log" (used to suppress storing)        */
+/* ------------------------------------------------------------------ */
+static int is_log_command(const ShellCmd *cmd)
+{
+    if (!cmd || cmd->group_count == 0) return 0;
+    const CmdGroup *g = &cmd->groups[0];
+    if (g->command_count == 0) return 0;
+    const AtomicCmd *a = &g->commands[0];
+    return (a->name && strcmp(a->name, "log") == 0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Execute a single atomic command (dispatch to builtins)              */
+/* ------------------------------------------------------------------ */
+static int exec_atomic(const AtomicCmd *a)
+{
+    if (!a->name)
+        return 0;
+
+    if (strcmp(a->name, "hop") == 0)
+        return builtin_hop(a->args, a->arg_count);
+    else if (strcmp(a->name, "reveal") == 0)
+        return builtin_reveal(a->args, a->arg_count);
+    else if (strcmp(a->name, "log") == 0)
+        return builtin_log(a->args, a->arg_count);
+    else {
+        /* Non-builtin: cannot exec* (Part C will handle) */
+        fprintf(stderr, "%s: command not found\n", a->name);
+        return 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Execute a parsed ShellCmd                                          */
+/* ------------------------------------------------------------------ */
+static int exec_cmd(ShellCmd *cmd)
+{
+    if (!cmd)
+        return 0;
+
+    int ret = 0;
+
+    for (int g = 0; g < cmd->group_count; g++) {
+        CmdGroup *cg = &cmd->groups[g];
+
+        for (int c = 0; c < cg->command_count; c++) {
+            ret = exec_atomic(&cg->commands[c]);
+        }
+
+        /* Handle separators: ';' means wait, '&' means background */
+        /* For now (Part B), just execute sequentially */
+        if (g < cmd->group_count - 1 && cmd->separators) {
+            /* ; or & -- just continue to next group */
+        }
+    }
+
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -57,6 +122,14 @@ int main(void)
 
         if (!valid) {
             printf("Invalid Syntax!\n");
+        } else {
+            /* Add to log BEFORE executing (unless it's a log command) */
+            if (!is_log_command(cmd)) {
+                log_add(line);
+            }
+
+            /* Execute */
+            exec_cmd(cmd);
         }
 
         /* Cleanup */
@@ -64,6 +137,9 @@ int main(void)
         lexer_free_tokens(tokens, tok_count);
         free(line);
     }
+
+    /* Clean up on exit */
+    log_free();
 
     return 0;
 }

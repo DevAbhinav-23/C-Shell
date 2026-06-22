@@ -1,27 +1,30 @@
 /*
  * test_wrapper.c  --  Standalone test harness for the shell modules.
  *
- * Provides an easy way to test each module individually without
- * running the full interactive REPL.
+ * Tests for Part A (lexer, parser) and Part B (hop, reveal, log).
  *
  * Build:  make test
  * Run:    ./test.out
  *
  * Usage:
- *   1. Test the lexer:        ./test.out lexer  "cat foo | wc"
- *   2. Test the parser:       ./test.out parser "cat foo | wc"
- *   3. Test syntax validation: ./test.out valid  "cat | ; wc"
- *   4. Run interactive mode:  ./test.out interactive
- *   5. Run all built-in tests: ./test.out selftest
+ *   ./test.out lexer  "cat foo | wc"
+ *   ./test.out parser "cat foo | wc"
+ *   ./test.out valid  "cat | ; wc"
+ *   ./test.out interactive
+ *   ./test.out selftest
+ *   ./test.out test_hop
+ *   ./test.out test_reveal
+ *   ./test.out test_log
  */
 #include "shell.h"
 #include "prompt.h"
 #include "input.h"
 #include "lexer.h"
 #include "parser.h"
-#include <getopt.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
-/* Global state required by prompt module */
+/* Global state required by shell modules */
 ShellState g_shell;
 
 /* ------------------------------------------------------------------ */
@@ -82,6 +85,53 @@ static int is_valid_syntax(const char *input)
     parser_free_cmd(cmd);
     lexer_free_tokens(tokens, tc);
     return valid;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Shell init helper for builtins tests                                */
+/* ------------------------------------------------------------------ */
+static void test_shell_init(void)
+{
+    if (getcwd(g_shell.home_dir, sizeof(g_shell.home_dir)) == NULL)
+        strcpy(g_shell.home_dir, ".");
+    g_shell.prev_cwd[0] = '\0';
+    g_shell.has_prev_cwd = 0;
+    log_init();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helper: run a builtin command from args array                      */
+/* ------------------------------------------------------------------ */
+static int run_cmd(const char *input)
+{
+    int tc = 0;
+    Token *tokens = lexer_tokenize(input, &tc);
+    int valid = 0;
+    ShellCmd *cmd = parser_parse(tokens, tc, &valid);
+    if (!valid || !cmd) {
+        parser_free_cmd(cmd);
+        lexer_free_tokens(tokens, tc);
+        return -1;
+    }
+    int ret = 0;
+    CmdGroup *cg = &cmd->groups[0];
+    AtomicCmd *a = &cg->commands[0];
+    if (strcmp(a->name, "hop") == 0)
+        ret = builtin_hop(a->args, a->arg_count);
+    else if (strcmp(a->name, "reveal") == 0)
+        ret = builtin_reveal(a->args, a->arg_count);
+    else if (strcmp(a->name, "log") == 0)
+        ret = builtin_log(a->args, a->arg_count);
+    parser_free_cmd(cmd);
+    lexer_free_tokens(tokens, tc);
+    return ret;
+}
+
+/* Helper: get current cwd */
+static void get_cwd(char *buf, size_t sz)
+{
+    if (getcwd(buf, sz) == NULL)
+        strcpy(buf, "?");
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,38 +288,196 @@ static void test_prompt(void)
     printf("  [PASS] prompt_print() ran without crash\n");
 }
 
-static void shell_init(void)
+/* ------------------------------------------------------------------ */
+/*  Hop tests  (B.1)                                                   */
+/* ------------------------------------------------------------------ */
+static void test_hop(void)
 {
-    if (getcwd(g_shell.home_dir, sizeof(g_shell.home_dir)) == NULL)
-        strcpy(g_shell.home_dir, ".");
+    printf("\n=== HOP TESTS ===\n");
+    char cwd[PATH_MAX];
+    char orig[PATH_MAX];
+    get_cwd(orig, sizeof(orig));
+
+    /* hop with no args -> home */
+    run_cmd("hop");
+    get_cwd(cwd, sizeof(cwd));
+    ASSERT_EQ_STR("hop (no args) -> home", g_shell.home_dir, cwd);
+
+    /* hop . -> stay in place */
+    run_cmd("hop .");
+    get_cwd(cwd, sizeof(cwd));
+    ASSERT_EQ_STR("hop . -> stay", g_shell.home_dir, cwd);
+
+    /* hop .. -> go to parent */
+    run_cmd("hop ..");
+    get_cwd(cwd, sizeof(cwd));
+    /* parent of home is /home or / */
+    {
+        char expected[PATH_MAX + 32];
+        snprintf(expected, sizeof(expected), "%s/..", g_shell.home_dir);
+        /* Resolve expected to canonical form for comparison */
+        char exp_resolved[PATH_MAX];
+        if (resolve_path(expected, exp_resolved, sizeof(exp_resolved)) == 0)
+            ASSERT_EQ_STR("hop .. -> parent", exp_resolved, cwd);
+        else
+            ASSERT_EQ_STR("hop .. -> parent (raw)", expected, cwd);
+    }
+
+    /* hop - -> go back to home (prev was home) */
+    run_cmd("hop -");
+    get_cwd(cwd, sizeof(cwd));
+    ASSERT_EQ_STR("hop - -> back to home", g_shell.home_dir, cwd);
+
+    /* hop with nonexistent path */
+    ASSERT_EQ_INT("hop nonexistent -> error", 1, run_cmd("hop /nonexistent/path/xyz"));
+
+    /* hop ~ -> home */
+    run_cmd("hop /tmp");
+    get_cwd(cwd, sizeof(cwd));
+    ASSERT_EQ_STR("hop /tmp", "/tmp", cwd);
+
+    run_cmd("hop ~");
+    get_cwd(cwd, sizeof(cwd));
+    ASSERT_EQ_STR("hop ~ -> home", g_shell.home_dir, cwd);
+
+    /* Multiple args: hop ~ .. */
+    run_cmd("hop ~");
+    run_cmd("hop ~ ..");
+    get_cwd(cwd, sizeof(cwd));
+    {
+        char expected[PATH_MAX + 32];
+        snprintf(expected, sizeof(expected), "%s/..", g_shell.home_dir);
+        char exp_resolved[PATH_MAX];
+        if (resolve_path(expected, exp_resolved, sizeof(exp_resolved)) == 0)
+            ASSERT_EQ_STR("hop ~ .. -> parent of home", exp_resolved, cwd);
+        else
+            ASSERT_EQ_STR("hop ~ .. -> parent (raw)", expected, cwd);
+    }
+
+    /* Restore original CWD */
+    chdir(orig);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Reveal tests  (B.2)                                                */
+/* ------------------------------------------------------------------ */
+static void test_reveal(void)
+{
+    printf("\n=== REVEAL TESTS ===\n");
+
+    /* Create a test directory with known contents */
+    char orig[PATH_MAX];
+    get_cwd(orig, sizeof(orig));
+
+    char testdir[PATH_MAX];
+    snprintf(testdir, sizeof(testdir), "/tmp/cshell_test_reveal_XXXXXX");
+    /* Use mkdtemp for safety */
+    if (mkdtemp(testdir) == NULL) {
+        printf("  [SKIP] could not create temp dir\n");
+        chdir(orig);
+        return;
+    }
+
+    /* Create some files */
+    char fpath[PATH_MAX + 32];
+    snprintf(fpath, sizeof(fpath), "%s/aaa.txt", testdir);
+    FILE *f = fopen(fpath, "w"); fclose(f);
+    snprintf(fpath, sizeof(fpath), "%s/bbb.txt", testdir);
+    f = fopen(fpath, "w"); fclose(f);
+    snprintf(fpath, sizeof(fpath), "%s/.hidden", testdir);
+    f = fopen(fpath, "w"); fclose(f);
+
+    /* reveal without -a should not show .hidden */
+    /* We can't easily capture stdout, so just test that it doesn't crash */
+    {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd), "reveal %s", testdir);
+        int ret = run_cmd(cmd);
+        ASSERT_EQ_INT("reveal basic: success", 0, ret);
+    }
+
+    /* reveal -a should show .hidden */
+    {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd), "reveal -a %s", testdir);
+        int ret = run_cmd(cmd);
+        ASSERT_EQ_INT("reveal -a: success", 0, ret);
+    }
+
+    /* reveal -l should work */
+    {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd), "reveal -l %s", testdir);
+        int ret = run_cmd(cmd);
+        ASSERT_EQ_INT("reveal -l: success", 0, ret);
+    }
+
+    /* reveal -la should work */
+    {
+        char cmd[PATH_MAX + 32];
+        snprintf(cmd, sizeof(cmd), "reveal -la %s", testdir);
+        int ret = run_cmd(cmd);
+        ASSERT_EQ_INT("reveal -la: success", 0, ret);
+    }
+
+    /* reveal with nonexistent dir */
+    ASSERT_EQ_INT("reveal nonexistent: error", 1, run_cmd("reveal /nonexistent/path/xyz"));
+
+    /* reveal on current dir */
+    ASSERT_EQ_INT("reveal .: success", 0, run_cmd("reveal ."));
+
+    /* Clean up */
+    snprintf(fpath, sizeof(fpath), "%s/aaa.txt", testdir); unlink(fpath);
+    snprintf(fpath, sizeof(fpath), "%s/bbb.txt", testdir); unlink(fpath);
+    snprintf(fpath, sizeof(fpath), "%s/.hidden", testdir); unlink(fpath);
+    rmdir(testdir);
+    chdir(orig);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Log tests  (B.3)                                                   */
+/* ------------------------------------------------------------------ */
+static void test_log(void)
+{
+    printf("\n=== LOG TESTS ===\n");
+
+    /* Purge first to start clean */
+    run_cmd("log purge");
+    ASSERT_EQ_INT("log purge: success", 0, run_cmd("log purge"));
+
+    /* log with no entries -> nothing printed (just succeeds) */
+    ASSERT_EQ_INT("log (empty): success", 0, run_cmd("log"));
+
+    /* Add some commands to history manually */
+    log_add("ls -la");
+    log_add("hop ~");
+    log_add("pwd");
+
+    /* log should show 3 entries (oldest first) */
+    ASSERT_EQ_INT("log after 3 adds: success", 0, run_cmd("log"));
+
+    /* log execute 1 -> should execute the newest command (pwd) */
+    ASSERT_EQ_INT("log execute 1: success", 0, run_cmd("log execute 1"));
+
+    /* Duplicate: same command as last should not be added */
+    log_add("pwd");
+    log_add("pwd");  /* should be suppressed */
+    /* Only 4 entries total (ls -la, hop ~, pwd, pwd)
+
+     */
+    ASSERT_EQ_INT("log after dup: success", 0, run_cmd("log"));
+
+    /* log purge clears everything */
+    run_cmd("log purge");
+    ASSERT_EQ_INT("log after purge: success", 0, run_cmd("log"));
+
+    /* Invalid syntax */
+    ASSERT_EQ_INT("log log: invalid syntax", 1, run_cmd("log log"));
 }
 
 /* ------------------------------------------------------------------ */
 /*  CLI modes                                                          */
 /* ------------------------------------------------------------------ */
-static void mode_interactive(void)
-{
-    shell_init();
-    printf("Interactive mode (Ctrl-D to exit)\n");
-    while (1) {
-        prompt_print();
-        char *line = input_read_line();
-        if (!line) { printf("\n"); break; }
-        if (line[0] == '\0') { free(line); continue; }
-
-        int tc = 0;
-        Token *tokens = lexer_tokenize(line, &tc);
-        int valid = 0;
-        ShellCmd *cmd = parser_parse(tokens, tc, &valid);
-        if (!valid)
-            printf("Invalid Syntax!\n");
-
-        parser_free_cmd(cmd);
-        lexer_free_tokens(tokens, tc);
-        free(line);
-    }
-}
-
 static void mode_lexer(const char *input)
 {
     printf("Tokens for: \"%s\"\n", input);
@@ -331,6 +539,51 @@ static void mode_valid(const char *input)
     printf("%s -> %s\n", input, is_valid_syntax(input) ? "VALID" : "INVALID");
 }
 
+static void mode_interactive(void)
+{
+    test_shell_init();
+    printf("Interactive mode (Ctrl-D to exit)\n");
+    while (1) {
+        prompt_print();
+        char *line = input_read_line();
+        if (!line) { printf("\n"); break; }
+        if (line[0] == '\0') { free(line); continue; }
+
+        int tc = 0;
+        Token *tokens = lexer_tokenize(line, &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(tokens, tc, &valid);
+        if (!valid) {
+            printf("Invalid Syntax!\n");
+        } else {
+            if (cmd && !(cmd->group_count > 0 &&
+                cmd->groups[0].command_count > 0 &&
+                cmd->groups[0].commands[0].name &&
+                strcmp(cmd->groups[0].commands[0].name, "log") == 0)) {
+                log_add(line);
+            }
+
+            if (cmd) {
+                CmdGroup *cg = &cmd->groups[0];
+                AtomicCmd *a = &cg->commands[0];
+                if (a->name && strcmp(a->name, "hop") == 0)
+                    builtin_hop(a->args, a->arg_count);
+                else if (a->name && strcmp(a->name, "reveal") == 0)
+                    builtin_reveal(a->args, a->arg_count);
+                else if (a->name && strcmp(a->name, "log") == 0)
+                    builtin_log(a->args, a->arg_count);
+                else
+                    fprintf(stderr, "%s: command not found\n", a->name);
+            }
+        }
+
+        parser_free_cmd(cmd);
+        lexer_free_tokens(tokens, tc);
+        free(line);
+    }
+    log_free();
+}
+
 /* ------------------------------------------------------------------ */
 /*  Usage                                                              */
 /* ------------------------------------------------------------------ */
@@ -344,7 +597,10 @@ static void usage(void)
         "  parser <input>     Parse input and print structure\n"
         "  valid  <input>     Check if input is syntactically valid\n"
         "  interactive        Run the shell in interactive mode\n"
-        "  selftest           Run all built-in unit tests\n"
+        "  selftest           Run all built-in unit tests (Part A + B)\n"
+        "  test_hop           Run hop tests only\n"
+        "  test_reveal        Run reveal tests only\n"
+        "  test_log           Run log tests only\n"
         "  prompt             Test the prompt module\n"
         "\n"
         "Examples:\n"
@@ -363,6 +619,8 @@ int main(int argc, char *argv[])
     /* Init shell state for prompt */
     if (getcwd(g_shell.home_dir, sizeof(g_shell.home_dir)) == NULL)
         strcpy(g_shell.home_dir, ".");
+    g_shell.prev_cwd[0] = '\0';
+    g_shell.has_prev_cwd = 0;
 
     if (argc < 2) {
         usage();
@@ -383,12 +641,29 @@ int main(int argc, char *argv[])
     } else if (strcmp(cmd, "interactive") == 0) {
         mode_interactive();
     } else if (strcmp(cmd, "selftest") == 0) {
+        test_shell_init();
         test_lexer();
         test_parser();
         test_prompt();
+        test_hop();
+        test_reveal();
+        test_log();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
         return (tests_passed == tests_run) ? 0 : 1;
+    } else if (strcmp(cmd, "test_hop") == 0) {
+        test_shell_init();
+        test_hop();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_reveal") == 0) {
+        test_shell_init();
+        test_reveal();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_log") == 0) {
+        test_shell_init();
+        test_log();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
     } else if (strcmp(cmd, "prompt") == 0) {
+        test_shell_init();
         test_prompt();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
     } else {
