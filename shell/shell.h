@@ -17,6 +17,7 @@
 #define SHELL_MAX_ARGS  256
 #define SHELL_MAX_CMDS  64
 #define SHELL_MAX_REDIR 16
+#define SHELL_MAX_HISTORY 15
 
 /* ──────────────────────────────────────────────────────────
  *  Token Types  (used by the lexer and parser)
@@ -81,10 +82,24 @@ typedef struct {
 } ShellCmd;
 
 /* ──────────────────────────────────────────────────────────
+ *  History entry (for log command, Part B.3)
+ * ────────────────────────────────────────────────────────── */
+typedef struct {
+    char *cmd_line;            /* the raw command string               */
+} HistoryEntry;
+
+/* ──────────────────────────────────────────────────────────
  *  Global shell state
  * ────────────────────────────────────────────────────────── */
 typedef struct {
     char home_dir[PATH_MAX];   /* directory where the shell was started */
+    char prev_cwd[PATH_MAX];   /* previous CWD (for hop -)             */
+    int  has_prev_cwd;         /* 1 if prev_cwd is valid               */
+    char history_file[PATH_MAX]; /* path to persistent history file    */
+    HistoryEntry history[SHELL_MAX_HISTORY];
+    int  history_count;        /* number of entries in the ring buffer  */
+    int  history_head;         /* index of the newest entry             */
+    int  history_full;         /* 1 if the ring buffer has wrapped      */
 } ShellState;
 
 extern ShellState g_shell;
@@ -93,6 +108,7 @@ extern ShellState g_shell;
  *  Utility helpers  (utils.c)
  * ────────────────────────────────────────────────────────── */
 char *shell_strdup(const char *s);
+int   resolve_path(const char *arg, char *out, size_t out_sz);
 
 /* ──────────────────────────────────────────────────────────
  *  Prompt  (prompt.c)
@@ -115,5 +131,23 @@ void   lexer_free_tokens(Token *tokens, int count);
  * ────────────────────────────────────────────────────────── */
 ShellCmd *parser_parse(Token *tokens, int token_count, int *out_valid);
 void      parser_free_cmd(ShellCmd *cmd);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: hop  (builtin_hop.c)
+ * ────────────────────────────────────────────────────────── */
+int builtin_hop(char **args, int arg_count);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: reveal  (builtin_reveal.c)
+ * ────────────────────────────────────────────────────────── */
+int builtin_reveal(char **args, int arg_count);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: log  (builtin_log.c)
+ * ────────────────────────────────────────────────────────── */
+int  builtin_log(char **args, int arg_count);
+void log_init(void);          /* load persistent history on shell start */
+void log_add(const char *cmd); /* add a command to the log             */
+void log_free(void);          /* free all history entries on exit       */
 
 #endif /* SHELL_H */
