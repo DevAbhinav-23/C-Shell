@@ -9,6 +9,7 @@
 #include "input.h"
 #include "lexer.h"
 #include "parser.h"
+#include "executor.h"
 
 /* Global shell state */
 ShellState g_shell;
@@ -42,28 +43,10 @@ static int is_log_command(const ShellCmd *cmd)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Execute a single atomic command (dispatch to builtins)              */
-/* ------------------------------------------------------------------ */
-static int exec_atomic(const AtomicCmd *a)
-{
-    if (!a->name)
-        return 0;
-
-    if (strcmp(a->name, "hop") == 0)
-        return builtin_hop(a->args, a->arg_count);
-    else if (strcmp(a->name, "reveal") == 0)
-        return builtin_reveal(a->args, a->arg_count);
-    else if (strcmp(a->name, "log") == 0)
-        return builtin_log(a->args, a->arg_count);
-    else {
-        /* Non-builtin: cannot exec* (Part C will handle) */
-        /* Silently ignore -- exec* is banned until Part C */
-        return 0;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /*  Execute a parsed ShellCmd                                          */
+/*                                                                     */
+/*  Part C: only the first cmd_group is executed.  Sequential (;) and  */
+/*  background (&, &&) operators cause remaining groups to be ignored. */
 /* ------------------------------------------------------------------ */
 static int exec_cmd(ShellCmd *cmd)
 {
@@ -72,18 +55,9 @@ static int exec_cmd(ShellCmd *cmd)
 
     int ret = 0;
 
-    for (int g = 0; g < cmd->group_count; g++) {
-        CmdGroup *cg = &cmd->groups[g];
-
-        for (int c = 0; c < cg->command_count; c++) {
-            ret = exec_atomic(&cg->commands[c]);
-        }
-
-        /* Handle separators: ';' means wait, '&' means background */
-        /* For now (Part B), just execute sequentially */
-        if (g < cmd->group_count - 1 && cmd->separators) {
-            /* ; or & -- just continue to next group */
-        }
+    /* Only execute the first cmd_group — see Part C spec */
+    if (cmd->group_count > 0) {
+        ret = exec_cmd_group(&cmd->groups[0]);
     }
 
     return ret;

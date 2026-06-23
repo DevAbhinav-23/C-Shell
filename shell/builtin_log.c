@@ -12,6 +12,7 @@
  * History persists across shell sessions via a file (~/.cshell_history).
  */
 #include "shell.h"
+#include "executor.h"
 #include <dirent.h>
 
 /* ──────────────────────────────────────────────────────────
@@ -254,7 +255,7 @@ int builtin_log(char **args, int arg_count)
          */
         printf("%s\n", cmd);
 
-        /* Re-parse and execute */
+        /* Re-parse and execute using the executor (supports pipes, redirects, etc.) */
         int tc = 0;
         Token *tokens = lexer_tokenize(cmd, &tc);
         int valid = 0;
@@ -265,22 +266,10 @@ int builtin_log(char **args, int arg_count)
             return 0;
         }
 
-        /* Execute each group */
+        /* Execute each group via the executor */
         int ret = 0;
         for (int g = 0; g < scmd->group_count; g++) {
-            CmdGroup *cg = &scmd->groups[g];
-            for (int c = 0; c < cg->command_count; c++) {
-                AtomicCmd *ac = &cg->commands[c];
-                if (!ac->name) continue;
-
-                if (strcmp(ac->name, "hop") == 0)
-                    ret = builtin_hop(ac->args, ac->arg_count);
-                else if (strcmp(ac->name, "reveal") == 0)
-                    ret = builtin_reveal(ac->args, ac->arg_count);
-                else if (strcmp(ac->name, "log") == 0)
-                    ret = builtin_log(ac->args, ac->arg_count);
-                /* For non-builtins, we can't exec* -- Part C will handle */
-            }
+            ret = exec_cmd_group(&scmd->groups[g]);
         }
 
         parser_free_cmd(scmd);
