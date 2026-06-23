@@ -19,9 +19,9 @@ CFLAGS   = -std=c99 \
            -g
 
 # Source files for the shell
-SRCS     = main.c prompt.c input.c lexer.c parser.c utils.c \
+SRCS     = main.c prompt.c input.c lexer.c parser.c utils.c executor.c \
            builtin_hop.c builtin_reveal.c builtin_log.c
-HDRS     = shell.h prompt.h input.h lexer.h parser.h \
+HDRS     = shell.h prompt.h input.h lexer.h parser.h executor.h \
            builtin_hop.h builtin_reveal.h builtin_log.h
 OBJS     = $(SRCS:.c=.o)
 
