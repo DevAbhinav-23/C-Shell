@@ -212,7 +212,14 @@ static int parse_atomic(Parser *p, AtomicCmd *a)
         }
     }
 
-    /* Build the AtomicCmd */
+    /* Build the AtomicCmd — ensure args are NULL-terminated for execvp */
+    if (args.count >= args.capacity) {
+        args.capacity = args.capacity ? args.capacity * 2 : 8;
+        args.items = realloc(args.items, sizeof(char *) * (size_t)args.capacity);
+    }
+    args.items[args.count] = NULL;
+    /* args.count remains the true arg count (excluding sentinel) */
+
     a->name = (args.count > 0) ? shell_strdup(args.items[0]) : NULL;
     a->arg_count = args.count;
     a->args = args.items; /* transfer ownership */
