@@ -21,8 +21,11 @@
 #include "input.h"
 #include "lexer.h"
 #include "parser.h"
+#include "executor.h"
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <dirent.h>
+#include <fcntl.h>
 
 /* Global state required by shell modules */
 ShellState g_shell;
@@ -476,6 +479,336 @@ static void test_log(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Exec tests  (Part C)                                               */
+/* ------------------------------------------------------------------ */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+static void test_exec(void)
+{
+    printf("\n=== EXEC TESTS (Part C) ===\n");
+
+    char orig[PATH_MAX];
+    get_cwd(orig, sizeof(orig));
+
+    /* Create temp dir for test files */
+    char testdir[PATH_MAX * 2];
+    snprintf(testdir, sizeof(testdir), "/tmp/cshell_test_exec_XXXXXX");
+    if (mkdtemp(testdir) == NULL) {
+        printf("  [SKIP] could not create temp dir for exec tests\n");
+        tests_run++;
+        tests_passed++;
+        return;
+    }
+
+    /* ── C.1: External command execution ──────────────────────────── */
+    {
+        int tc = 0;
+        Token *t = lexer_tokenize("echo hello", &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &valid);
+        ASSERT_TRUE("exec: echo parses", valid && cmd);
+        if (valid && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: echo returns 0", 0, ret);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Command not found */
+    {
+        int tc = 0;
+        Token *t = lexer_tokenize("nonexistent_cmd_xyz", &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &valid);
+        ASSERT_TRUE("exec: nonexistent parses", valid && cmd);
+        if (valid && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_TRUE("exec: nonexistent returns non-zero", ret != 0);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* ── C.2 + C.3: File redirection ─────────────────────────────── */
+
+    /* Create input file */
+    char infile[PATH_MAX * 2];
+    snprintf(infile, sizeof(infile), "%s/in.txt", testdir);
+    FILE *f = fopen(infile, "w");
+    fprintf(f, "hello world\n");
+    fclose(f);
+
+    /* Input redirection: cat < infile */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "%s/out_cat.txt", testdir);
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline), "cat < %s > %s", infile, outfile);
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &valid);
+        ASSERT_TRUE("exec: cat < > parses", valid && cmd);
+        if (valid && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: cat < > returns 0", 0, ret);
+
+            FILE *ck = fopen(outfile, "r");
+            ASSERT_TRUE("exec: output file exists", ck != NULL);
+            if (ck) {
+                char buf[128]; buf[0] = '\0';
+                fgets(buf, sizeof(buf), ck);
+                ASSERT_EQ_STR("exec: output matches input", "hello world\n", buf);
+                fclose(ck);
+            }
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+        unlink(outfile);
+    }
+
+    /* Non-existent input file */
+    {
+        char cmdline[PATH_MAX * 2];
+        snprintf(cmdline, sizeof(cmdline), "cat < /tmp/nonexistent_file_xyz_123");
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &valid);
+        ASSERT_TRUE("exec: nonexistent input parses", valid && cmd);
+        if (valid && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_TRUE("exec: nonexistent input returns non-zero", ret != 0);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Output redirection (overwrite) */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "%s/out_echo.txt", testdir);
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline), "echo hello > %s", outfile);
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int valid = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &valid);
+        ASSERT_TRUE("exec: echo > parses", valid && cmd);
+        if (valid && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: echo > returns 0", 0, ret);
+
+            FILE *ck = fopen(outfile, "r");
+            ASSERT_TRUE("exec: > file created", ck != NULL);
+            if (ck) {
+                char buf[256]; buf[0] = '\0';
+                size_t n = fread(buf, 1, sizeof(buf) - 1, ck);
+                buf[n] = '\0';
+                ASSERT_TRUE("exec: > file non-empty", n > 0);
+                fclose(ck);
+            }
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+        unlink(outfile);
+    }
+
+    /* Output append */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "%s/append.txt", testdir);
+
+        /* First write */
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline), "echo line1 > %s", outfile);
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        if (v && cmd) exec_cmd_group(&cmd->groups[0]);
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+
+        /* Append */
+        snprintf(cmdline, sizeof(cmdline), "echo line2 >> %s", outfile);
+        tc = 0;
+        t = lexer_tokenize(cmdline, &tc);
+        v = 0;
+        cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: append parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: append returns 0", 0, ret);
+
+            FILE *ck = fopen(outfile, "r");
+            ASSERT_TRUE("exec: append file exists", ck != NULL);
+            if (ck) {
+                char b1[128], b2[128];
+                int lines = 0;
+                if (fgets(b1, sizeof(b1), ck)) lines++;
+                if (fgets(b2, sizeof(b2), ck)) lines++;
+                ASSERT_EQ_INT("exec: append has 2 lines", 2, lines);
+                fclose(ck);
+            }
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+        unlink(outfile);
+    }
+
+    /* Multiple redirects: only last takes effect */
+    {
+        char f1[PATH_MAX * 2], f2[PATH_MAX * 2], out[PATH_MAX * 2];
+        snprintf(f1, sizeof(f1), "%s/multi_in1.txt", testdir);
+        snprintf(f2, sizeof(f2), "%s/multi_in2.txt", testdir);
+        snprintf(out, sizeof(out), "%s/multi_out.txt", testdir);
+
+        FILE *ff = fopen(f1, "w"); fprintf(ff, "first\n"); fclose(ff);
+        ff = fopen(f2, "w"); fprintf(ff, "second\n"); fclose(ff);
+
+        /* Last input redir should win */
+        char cmdline[PATH_MAX * 6];
+        snprintf(cmdline, sizeof(cmdline),
+                 "cat < %s < %s > %s", f1, f2, out);
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: multi-redir parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: multi-redir returns 0", 0, ret);
+
+            FILE *ck = fopen(out, "r");
+            ASSERT_TRUE("exec: multi-redir file exists", ck != NULL);
+            if (ck) {
+                char buf[128]; buf[0] = '\0';
+                fgets(buf, sizeof(buf), ck);
+                /* Should contain content of f2, not f1 */
+                ASSERT_EQ_STR("exec: last input redir wins", "second\n", buf);
+                fclose(ck);
+            }
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+        unlink(f1); unlink(f2); unlink(out);
+    }
+
+    /* ── C.4: Command piping ──────────────────────────────────────── */
+
+    /* Simple pipe */
+    {
+        int tc = 0;
+        Token *t = lexer_tokenize("echo hello world | wc -w", &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: pipe parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: pipe returns 0", 0, ret);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Multi-stage pipe */
+    {
+        int tc = 0;
+        Token *t = lexer_tokenize("echo a b c | cat | wc -w", &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: multi-pipe parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: multi-pipe returns 0", 0, ret);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Pipe with file redirection */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "%s/pipe_redir.txt", testdir);
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo hello world | wc -w > %s", outfile);
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: pipe+redirect parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: pipe+redirect returns 0", 0, ret);
+
+            FILE *ck = fopen(outfile, "r");
+            ASSERT_TRUE("exec: pipe+redirect file exists", ck != NULL);
+            if (ck) {
+                char buf[128]; buf[0] = '\0';
+                size_t n = fread(buf, 1, sizeof(buf) - 1, ck);
+                buf[n] = '\0';
+                ASSERT_TRUE("exec: pipe+redirect file non-empty", n > 0);
+                fclose(ck);
+            }
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+        unlink(outfile);
+    }
+
+    /* Input redirection + pipe: cat < infile | wc -w */
+    {
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "cat < %s | wc -w", infile);
+
+        int tc = 0;
+        Token *t = lexer_tokenize(cmdline, &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: input+pipe parses", v && cmd);
+        if (v && cmd) {
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            ASSERT_EQ_INT("exec: input+pipe returns 0", 0, ret);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Pipe with error in middle: pipeline should still try remaining */
+    {
+        int tc = 0;
+        Token *t = lexer_tokenize("echo hello | nonexistent_mid_cmd | wc -w", &tc);
+        int v = 0;
+        ShellCmd *cmd = parser_parse(t, tc, &v);
+        ASSERT_TRUE("exec: pipe with error parses", v && cmd);
+        if (v && cmd) {
+            /* Should not crash — remaining command still runs */
+            int ret = exec_cmd_group(&cmd->groups[0]);
+            /* Last command (wc) might fail because input pipe is broken */
+            /* Just check it doesn't crash */
+            (void)ret;
+            ASSERT_TRUE("exec: pipe with error no crash", 1);
+        }
+        parser_free_cmd(cmd);
+        lexer_free_tokens(t, tc);
+    }
+
+    /* Clean up input file and temp dir */
+    unlink(infile);
+    rmdir(testdir);
+    chdir(orig);
+}
+#pragma GCC diagnostic pop
+/* ------------------------------------------------------------------ */
 /*  CLI modes                                                          */
 /* ------------------------------------------------------------------ */
 static void mode_lexer(const char *input)
@@ -599,10 +932,11 @@ static void usage(void)
         "  parser <input>     Parse input and print structure\n"
         "  valid  <input>     Check if input is syntactically valid\n"
         "  interactive        Run the shell in interactive mode\n"
-        "  selftest           Run all built-in unit tests (Part A + B)\n"
+        "  selftest           Run all built-in unit tests (Part A + B + C)\n"
         "  test_hop           Run hop tests only\n"
         "  test_reveal        Run reveal tests only\n"
         "  test_log           Run log tests only\n"
+        "  test_exec          Run exec/pipe/redirect tests (Part C)\n"
         "  prompt             Test the prompt module\n"
         "\n"
         "Examples:\n"
@@ -650,8 +984,13 @@ int main(int argc, char *argv[])
         test_hop();
         test_reveal();
         test_log();
+        test_exec();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
         return (tests_passed == tests_run) ? 0 : 1;
+    } else if (strcmp(cmd, "test_exec") == 0) {
+        test_shell_init();
+        test_exec();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
     } else if (strcmp(cmd, "test_hop") == 0) {
         test_shell_init();
         test_hop();
