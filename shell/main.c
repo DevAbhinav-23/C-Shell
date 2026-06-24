@@ -28,6 +28,10 @@ static void shell_init(void)
 
     /* Initialise the log / history subsystem */
     log_init();
+
+    /* Initialise background job tracking (Part D.2) */
+    g_shell.bg_job_count   = 0;
+    g_shell.bg_next_job_id = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -45,8 +49,13 @@ static int is_log_command(const ShellCmd *cmd)
 /* ------------------------------------------------------------------ */
 /*  Execute a parsed ShellCmd                                          */
 /*                                                                     */
-/*  Part C: only the first cmd_group is executed.  Sequential (;) and  */
-/*  background (&, &&) operators cause remaining groups to be ignored. */
+/*  Part D: iterates over all cmd_groups.  The separators array tells   */
+/*  us how to run each group:                                          */
+/*      separators[i] == 0  →  sequential (;): wait for completion     */
+/*      separators[i] == 1  →  background (&): fork and don't wait     */
+/*      trailing_amp == 1   →  last group also runs in background      */
+/*                                                                     */
+/*  If a sequential command fails, subsequent commands still run.       */
 /* ------------------------------------------------------------------ */
 static int exec_cmd(ShellCmd *cmd)
 {
@@ -55,9 +64,25 @@ static int exec_cmd(ShellCmd *cmd)
 
     int ret = 0;
 
-    /* Only execute the first cmd_group — see Part C spec */
-    if (cmd->group_count > 0) {
-        ret = exec_cmd_group(&cmd->groups[0]);
+    for (int i = 0; i < cmd->group_count; i++) {
+        /* Determine if this group should run in background */
+        int is_bg;
+        if (i < cmd->group_count - 1) {
+            /* There is a separator after this group */
+            is_bg = cmd->separators[i];
+        } else {
+            /* Last group — check trailing & */
+            is_bg = cmd->trailing_amp;
+        }
+
+        if (is_bg) {
+            /* Background execution — fork and don't wait */
+            exec_cmd_group_bg(&cmd->groups[i]);
+        } else {
+            /* Sequential execution — wait for completion */
+            /* Continue even if the command fails (D.1 spec) */
+            ret = exec_cmd_group(&cmd->groups[i]);
+        }
     }
 
     return ret;
@@ -79,6 +104,9 @@ int main(void)
             printf("\n");
             break;
         }
+
+        /* Check for completed background processes before parsing (D.2) */
+        check_background_jobs();
 
         /* Skip empty input */
         if (line[0] == '\0') {
