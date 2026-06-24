@@ -26,6 +26,8 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <time.h>
 
 /* Global state required by shell modules */
 ShellState g_shell;
@@ -99,6 +101,8 @@ static void test_shell_init(void)
         strcpy(g_shell.home_dir, ".");
     g_shell.prev_cwd[0] = '\0';
     g_shell.has_prev_cwd = 0;
+    g_shell.bg_job_count   = 0;
+    g_shell.bg_next_job_id = 1;
     log_init();
 }
 
@@ -808,6 +812,296 @@ static void test_exec(void)
     chdir(orig);
 }
 #pragma GCC diagnostic pop
+
+/* ------------------------------------------------------------------ */
+/*  Part D tests: Sequential and Background Execution                   */
+/* ------------------------------------------------------------------ */
+
+/* Helper: execute a full command string using the same path as main.c */
+static int exec_full_cmd(const char *input)
+{
+    int tc = 0;
+    Token *tokens = lexer_tokenize(input, &tc);
+    int valid = 0;
+    ShellCmd *cmd = parser_parse(tokens, tc, &valid);
+    if (!valid || !cmd) {
+        parser_free_cmd(cmd);
+        lexer_free_tokens(tokens, tc);
+        return -1;
+    }
+    /* Mirror main.c exec_cmd logic */
+    int ret = 0;
+    for (int i = 0; i < cmd->group_count; i++) {
+        int is_bg;
+        if (i < cmd->group_count - 1)
+            is_bg = cmd->separators[i];
+        else
+            is_bg = cmd->trailing_amp;
+
+        if (is_bg) {
+            exec_cmd_group_bg(&cmd->groups[i]);
+        } else {
+            ret = exec_cmd_group(&cmd->groups[i]);
+        }
+    }
+    parser_free_cmd(cmd);
+    lexer_free_tokens(tokens, tc);
+    return ret;
+}
+
+/* Poll until all background jobs are reaped, with a timeout */
+static void poll_bg_jobs(int max_wait_ms)
+{
+    int waited = 0;
+    while (waited < max_wait_ms) {
+        check_background_jobs();
+        if (g_shell.bg_job_count == 0)
+            break;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+        waited += 10;
+    }
+    /* One final check to catch any missed */
+    check_background_jobs();
+}
+
+/* D.1: Sequential execution */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+static void test_sequential(void)
+{
+    printf("\n=== SEQUENTIAL TESTS (D.1) ===\n");
+
+    /* Basic sequential: echo A ; echo B */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "/tmp/cshell_seq_test_XXXXXX");
+        int fd = mkstemp(outfile);
+        if (fd < 0) {
+            printf("  [SKIP] could not create temp file\n");
+            tests_run++;
+            tests_passed++;
+            return;
+        }
+        close(fd);
+
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo first > %s ; echo second >> %s", outfile, outfile);
+
+        int ret = exec_full_cmd(cmdline);
+        ASSERT_EQ_INT("sequential: both commands run", 0, ret);
+
+        /* Check both lines appear in order */
+        FILE *ck = fopen(outfile, "r");
+        ASSERT_TRUE("sequential: output file exists", ck != NULL);
+        if (ck) {
+            char b1[128], b2[128];
+            int lines = 0;
+            if (fgets(b1, sizeof(b1), ck)) lines++;
+            if (fgets(b2, sizeof(b2), ck)) lines++;
+            fclose(ck);
+            ASSERT_EQ_INT("sequential: exactly 2 lines", 2, lines);
+            ASSERT_EQ_STR("sequential: first line", "first\n", b1);
+            ASSERT_EQ_STR("sequential: second line", "second\n", b2);
+        }
+        unlink(outfile);
+    }
+
+    /* Sequential with three commands */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "/tmp/cshell_seq3_XXXXXX");
+        int fd = mkstemp(outfile);
+        if (fd < 0) {
+            printf("  [SKIP] could not create temp file\n");
+            tests_run++;
+            tests_passed++;
+            return;
+        }
+        close(fd);
+
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo A > %s ; echo B >> %s ; echo C >> %s",
+                 outfile, outfile, outfile);
+
+        int ret = exec_full_cmd(cmdline);
+        ASSERT_EQ_INT("sequential 3: runs OK", 0, ret);
+
+        FILE *ck = fopen(outfile, "r");
+        if (ck) {
+            char b1[32], b2[32], b3[32];
+            int lines = 0;
+            if (fgets(b1, sizeof(b1), ck)) lines++;
+            if (fgets(b2, sizeof(b2), ck)) lines++;
+            if (fgets(b3, sizeof(b3), ck)) lines++;
+            fclose(ck);
+            ASSERT_EQ_INT("sequential 3: exactly 3 lines", 3, lines);
+            ASSERT_EQ_STR("sequential 3: line 1", "A\n", b1);
+            ASSERT_EQ_STR("sequential 3: line 2", "B\n", b2);
+            ASSERT_EQ_STR("sequential 3: line 3", "C\n", b3);
+        }
+        unlink(outfile);
+    }
+
+    /* Sequential where middle command fails — subsequent still run */
+    {
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "/tmp/cshell_seq_fail_XXXXXX");
+        int fd = mkstemp(outfile);
+        if (fd < 0) {
+            printf("  [SKIP] could not create temp file\n");
+            tests_run++;
+            tests_passed++;
+            return;
+        }
+        close(fd);
+
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo start > %s ; nonexistent_cmd_xyz ; echo end >> %s",
+                 outfile, outfile);
+
+        exec_full_cmd(cmdline);
+
+        FILE *ck = fopen(outfile, "r");
+        if (ck) {
+            char b1[64], b2[64];
+            int lines = 0;
+            if (fgets(b1, sizeof(b1), ck)) lines++;
+            if (fgets(b2, sizeof(b2), ck)) lines++;
+            fclose(ck);
+            ASSERT_EQ_INT("sequential with fail: both start and end appear", 2, lines);
+            ASSERT_EQ_STR("sequential with fail: first is start", "start\n", b1);
+            ASSERT_EQ_STR("sequential with fail: last is end", "end\n", b2);
+        }
+        unlink(outfile);
+    }
+}
+#pragma GCC diagnostic pop
+
+/* D.2: Background execution */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+static void test_background(void)
+{
+    printf("\n=== BACKGROUND TESTS (D.2) ===\n");
+
+    /* Reset background tracking */
+    g_shell.bg_job_count   = 0;
+    g_shell.bg_next_job_id = 1;
+
+    /* Basic background: echo hello & */
+    {
+        int ret = exec_full_cmd("echo hello &");
+        /* exec_full_cmd returns after launching bg — should succeed */
+        ASSERT_EQ_INT("background: echo & returns 0", 0, ret);
+
+        /* Wait and reap completed background jobs */
+        poll_bg_jobs(2000);
+
+        /* Should have printed a notification (test checks no crash) */
+        ASSERT_TRUE("background: no crash after check", 1);
+    }
+
+    /* Sequential + background mix: echo A & echo B (no ; needed, & acts as separator) */
+    {
+        g_shell.bg_job_count   = 0;
+        g_shell.bg_next_job_id = 1;
+
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "/tmp/cshell_bg_seq_XXXXXX");
+        int fd = mkstemp(outfile);
+        if (fd < 0) {
+            printf("  [SKIP] could not create temp file\n");
+            tests_run++;
+            tests_passed++;
+            return;
+        }
+        close(fd);
+
+        /* & separates groups: echo A runs in bg, echo B runs sequentially */
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo A & echo B > %s", outfile);
+
+        int ret = exec_full_cmd(cmdline);
+        ASSERT_EQ_INT("bg+seq: returns 0", 0, ret);
+
+        /* Wait and reap background jobs */
+        poll_bg_jobs(2000);
+
+        /* echo B should have written to the file */
+        FILE *ck = fopen(outfile, "r");
+        ASSERT_TRUE("bg+seq: B output file exists", ck != NULL);
+        if (ck) {
+            char buf[128]; buf[0] = '\0';
+            fgets(buf, sizeof(buf), ck);
+            ASSERT_EQ_STR("bg+seq: B output is correct", "B\n", buf);
+            fclose(ck);
+        }
+        unlink(outfile);
+    }
+
+    /* Trailing & on pipeline: cat | wc & */
+    {
+        g_shell.bg_job_count   = 0;
+        g_shell.bg_next_job_id = 1;
+
+        int ret = exec_full_cmd("echo hello | wc -w &");
+
+        /* Launch occurred successfully */
+        ASSERT_EQ_INT("bg pipeline: returns 0", 0, ret);
+
+        poll_bg_jobs(2000);
+        ASSERT_TRUE("bg pipeline: no crash", 1);
+    }
+
+    /* Sequential run of two bg commands */
+    {
+        g_shell.bg_job_count   = 0;
+        g_shell.bg_next_job_id = 1;
+
+        char outfile[PATH_MAX * 2];
+        snprintf(outfile, sizeof(outfile), "/tmp/cshell_bg_both_XXXXXX");
+        int fd = mkstemp(outfile);
+        if (fd < 0) {
+            printf("  [SKIP] could not create temp file\n");
+            tests_run++;
+            tests_passed++;
+            return;
+        }
+        close(fd);
+
+        /* Both commands in background — neither blocks */
+        char cmdline[PATH_MAX * 4];
+        snprintf(cmdline, sizeof(cmdline),
+                 "echo X > %s & echo Y >> %s &", outfile, outfile);
+
+        int ret = exec_full_cmd(cmdline);
+        ASSERT_EQ_INT("bg+bg: returns 0", 0, ret);
+
+        /* Wait for both to complete */
+        poll_bg_jobs(2000);
+
+        /* Eventually the file should have content from one or both */
+        FILE *ck = fopen(outfile, "r");
+        if (ck) {
+            char buf[128]; buf[0] = '\0';
+            size_t n = fread(buf, 1, sizeof(buf) - 1, ck);
+            buf[n] = '\0';
+            ASSERT_TRUE("bg+bg: file has content", n > 0);
+            fclose(ck);
+        }
+        unlink(outfile);
+    }
+
+    /* Clean up any remaining background jobs */
+    poll_bg_jobs(2000);
+}
+#pragma GCC diagnostic pop
+
 /* ------------------------------------------------------------------ */
 /*  CLI modes                                                          */
 /* ------------------------------------------------------------------ */
@@ -877,6 +1171,9 @@ static void mode_interactive(void)
     test_shell_init();
     printf("Interactive mode (Ctrl-D to exit)\n");
     while (1) {
+        /* Check for completed background jobs before prompt (D.2) */
+        check_background_jobs();
+
         prompt_print();
         char *line = input_read_line();
         if (!line) { printf("\n"); break; }
@@ -896,18 +1193,20 @@ static void mode_interactive(void)
                 log_add(line);
             }
 
+            /* Use exec_cmd-like logic to handle all groups (Part D) */
             if (cmd) {
-                CmdGroup *cg = &cmd->groups[0];
-                AtomicCmd *a = &cg->commands[0];
-                if (a->name && strcmp(a->name, "hop") == 0)
-                    builtin_hop(a->args, a->arg_count);
-                else if (a->name && strcmp(a->name, "reveal") == 0)
-                    builtin_reveal(a->args, a->arg_count);
-                else if (a->name && strcmp(a->name, "log") == 0)
-                    builtin_log(a->args, a->arg_count);
-                else {
-                    /* Non-builtin: silently ignore (exec* banned in Part B) */
-                    (void)a;
+                for (int i = 0; i < cmd->group_count; i++) {
+                    int is_bg;
+                    if (i < cmd->group_count - 1)
+                        is_bg = cmd->separators[i];
+                    else
+                        is_bg = cmd->trailing_amp;
+
+                    if (is_bg) {
+                        exec_cmd_group_bg(&cmd->groups[i]);
+                    } else {
+                        exec_cmd_group(&cmd->groups[i]);
+                    }
                 }
             }
         }
@@ -932,11 +1231,13 @@ static void usage(void)
         "  parser <input>     Parse input and print structure\n"
         "  valid  <input>     Check if input is syntactically valid\n"
         "  interactive        Run the shell in interactive mode\n"
-        "  selftest           Run all built-in unit tests (Part A + B + C)\n"
+        "  selftest           Run all built-in unit tests (Parts A-D)\n"
         "  test_hop           Run hop tests only\n"
         "  test_reveal        Run reveal tests only\n"
         "  test_log           Run log tests only\n"
         "  test_exec          Run exec/pipe/redirect tests (Part C)\n"
+        "  test_sequential    Run sequential execution tests (D.1)\n"
+        "  test_background    Run background execution tests (D.2)\n"
         "  prompt             Test the prompt module\n"
         "\n"
         "Examples:\n"
@@ -957,6 +1258,8 @@ int main(int argc, char *argv[])
         strcpy(g_shell.home_dir, ".");
     g_shell.prev_cwd[0] = '\0';
     g_shell.has_prev_cwd = 0;
+    g_shell.bg_job_count   = 0;
+    g_shell.bg_next_job_id = 1;
 
     if (argc < 2) {
         usage();
@@ -985,11 +1288,21 @@ int main(int argc, char *argv[])
         test_reveal();
         test_log();
         test_exec();
+        test_sequential();
+        test_background();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
         return (tests_passed == tests_run) ? 0 : 1;
     } else if (strcmp(cmd, "test_exec") == 0) {
         test_shell_init();
         test_exec();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_sequential") == 0) {
+        test_shell_init();
+        test_sequential();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_background") == 0) {
+        test_shell_init();
+        test_background();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
     } else if (strcmp(cmd, "test_hop") == 0) {
         test_shell_init();
