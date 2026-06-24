@@ -223,3 +223,131 @@ int exec_cmd_group(const CmdGroup *g)
 
     return ret;
 }
+
+/* ──────────────────────────────────────────────────────────
+ *  exec_cmd_group_bg  --  Execute a command group in background
+ *
+ *  Forks a child process to run the command group without waiting.
+ *  The child's stdin is redirected to /dev/null so background
+ *  processes do not read from the terminal.
+ *
+ *  Prints the background job number and PID in the format:
+ *    [job_number] pid
+ *
+ *  Returns the job number (>= 1) on success, -1 on failure.
+ * ────────────────────────────────────────────────────────── */
+int exec_cmd_group_bg(const CmdGroup *g)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* ── CHILD ───────────────────────────────────────── */
+
+        /* Redirect stdin to /dev/null (no terminal access) */
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+
+        /* Separate process group so the shell isn't affected */
+        setpgid(0, 0);
+
+        /* Run the command group and exit with its status */
+        _exit(exec_cmd_group(g));
+    }
+
+    /* ── PARENT ──────────────────────────────────────────── */
+
+    /* Assign a job number */
+    int job_id = g_shell.bg_next_job_id++;
+
+    /* Record the job */
+    if (g_shell.bg_job_count < SHELL_MAX_BG_JOBS) {
+        BgJob *j = &g_shell.bg_jobs[g_shell.bg_job_count++];
+        j->pid    = pid;
+        j->job_id = job_id;
+        j->running = 1;
+
+        /* Extract the first command name for later reporting */
+        const char *name = (g->command_count > 0 && g->commands[0].name)
+                               ? g->commands[0].name : "unknown";
+        strncpy(j->cmd_name, name, sizeof(j->cmd_name) - 1);
+        j->cmd_name[sizeof(j->cmd_name) - 1] = '\0';
+    } else {
+        fprintf(stderr, "bg: job table full, %s (pid %d) not tracked\n",
+                g->command_count > 0 && g->commands[0].name
+                    ? g->commands[0].name : "unknown", (int)pid);
+    }
+
+    /* Print the background notification */
+    printf("[%d] %d\n", job_id, (int)pid);
+    fflush(stdout);
+
+    return job_id;
+}
+
+/* ──────────────────────────────────────────────────────────
+ *  check_background_jobs  --  Reap and report completed bg jobs
+ *
+ *  Called after reading user input (before parsing).  Uses
+ *  waitpid(WNOHANG) to check every tracked background process.
+ *  When a process has completed prints:
+ *      command_name with pid process_id exited normally
+ *  or
+ *      command_name with pid process_id exited abnormally
+ *
+ *  Completed jobs are removed from the tracking array.
+ * ────────────────────────────────────────────────────────── */
+void check_background_jobs(void)
+{
+    int i = 0;
+    while (i < g_shell.bg_job_count) {
+        BgJob *j = &g_shell.bg_jobs[i];
+
+        if (!j->running) {
+            /* Already handled — remove by shifting */
+            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+            g_shell.bg_job_count--;
+            continue;
+        }
+
+        int status;
+        pid_t ret = waitpid(j->pid, &status, WNOHANG);
+
+        if (ret == j->pid) {
+            /* Process has completed */
+            j->running = 0;
+
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                printf("%s with pid %d exited normally\n",
+                       j->cmd_name, (int)j->pid);
+            } else {
+                printf("%s with pid %d exited abnormally\n",
+                       j->cmd_name, (int)j->pid);
+            }
+            fflush(stdout);
+
+            /* Remove this entry by swapping with the last */
+            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+            g_shell.bg_job_count--;
+            /* Don't advance i — we swapped in a new entry to check */
+        } else if (ret == 0) {
+            /* Still running */
+            i++;
+        } else {
+            /* waitpid error (ECHILD etc.) — treat as completed */
+            j->running = 0;
+            printf("%s with pid %d exited abnormally\n",
+                   j->cmd_name, (int)j->pid);
+            fflush(stdout);
+
+            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+            g_shell.bg_job_count--;
+        }
+    }
+}

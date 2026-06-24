@@ -18,6 +18,7 @@
 #define SHELL_MAX_CMDS  64
 #define SHELL_MAX_REDIR 16
 #define SHELL_MAX_HISTORY 15
+#define SHELL_MAX_BG_JOBS 64
 
 /* ──────────────────────────────────────────────────────────
  *  Token Types  (used by the lexer and parser)
@@ -89,6 +90,16 @@ typedef struct {
 } HistoryEntry;
 
 /* ──────────────────────────────────────────────────────────
+ *  Background job tracking  (Part D.2)
+ * ────────────────────────────────────────────────────────── */
+typedef struct {
+    pid_t pid;
+    char  cmd_name[256];
+    int   job_id;
+    int   running;   /* 1 if still running */
+} BgJob;
+
+/* ──────────────────────────────────────────────────────────
  *  Global shell state
  * ────────────────────────────────────────────────────────── */
 typedef struct {
@@ -100,6 +111,9 @@ typedef struct {
     int  history_count;        /* number of entries in the ring buffer  */
     int  history_head;         /* index of the newest entry             */
     int  history_full;         /* 1 if the ring buffer has wrapped      */
+    BgJob bg_jobs[SHELL_MAX_BG_JOBS];
+    int   bg_job_count;
+    int   bg_next_job_id;
 } ShellState;
 
 extern ShellState g_shell;
@@ -131,6 +145,13 @@ void   lexer_free_tokens(Token *tokens, int count);
  * ────────────────────────────────────────────────────────── */
 ShellCmd *parser_parse(Token *tokens, int token_count, int *out_valid);
 void      parser_free_cmd(ShellCmd *cmd);
+
+/* ──────────────────────────────────────────────────────────
+ *  Executor  (executor.c)
+ * ────────────────────────────────────────────────────────── */
+int exec_cmd_group(const CmdGroup *g);
+int exec_cmd_group_bg(const CmdGroup *g);
+void check_background_jobs(void);
 
 /* ──────────────────────────────────────────────────────────
  *  Builtin: hop  (builtin_hop.c)
