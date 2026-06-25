@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <signal.h>
 
 /* ──────────────────────────────────────────────────────────
  *  Constants
@@ -90,13 +91,24 @@ typedef struct {
 } HistoryEntry;
 
 /* ──────────────────────────────────────────────────────────
- *  Background job tracking  (Part D.2)
+ *  Job state (Part E)
+ * ────────────────────────────────────────────────────────── */
+typedef enum {
+    JOB_RUNNING,
+    JOB_STOPPED
+} JobState;
+
+/* ──────────────────────────────────────────────────────────
+ *  Background / stopped job tracking  (Parts D + E)
  * ────────────────────────────────────────────────────────── */
 typedef struct {
-    pid_t pid;
-    char  cmd_name[256];
-    int   job_id;
-    int   running;   /* 1 if still running */
+    pid_t     pid;              /* representative PID                  */
+    pid_t     pgid;             /* process group ID                    */
+    char      cmd_name[256];    /* first command name                  */
+    char      full_cmd[1024];   /* full reconstructed command string   */
+    int       job_id;           /* job number (display / fg / bg)      */
+    JobState  state;            /* Running or Stopped                  */
+    int       is_bg;            /* 1 if background, 0 if stopped-fg    */
 } BgJob;
 
 /* ──────────────────────────────────────────────────────────
@@ -114,9 +126,11 @@ typedef struct {
     BgJob bg_jobs[SHELL_MAX_BG_JOBS];
     int   bg_job_count;
     int   bg_next_job_id;
+    volatile pid_t foreground_pgid;  /* PID/PGID of foreground process (Part E) */
 } ShellState;
 
 extern ShellState g_shell;
+extern volatile sig_atomic_t g_sigchld_received;
 
 /* ──────────────────────────────────────────────────────────
  *  Utility helpers  (utils.c)
@@ -149,9 +163,24 @@ void      parser_free_cmd(ShellCmd *cmd);
 /* ──────────────────────────────────────────────────────────
  *  Executor  (executor.c)
  * ────────────────────────────────────────────────────────── */
-int exec_cmd_group(const CmdGroup *g);
-int exec_cmd_group_bg(const CmdGroup *g);
+int  exec_cmd_group(const CmdGroup *g);
+int  exec_cmd_group_bg(const CmdGroup *g);
 void check_background_jobs(void);
+void kill_all_children(void);
+
+/* Job management helpers (executor.c) */
+int    add_job(pid_t pid, pid_t pgid, const char *cmd_name,
+               const char *full_cmd, JobState state, int is_bg);
+void   remove_job_by_pid(pid_t pid);
+BgJob *find_job_by_id(int job_id);
+BgJob *find_job_by_pgid(pid_t pgid);
+void   cleanup_done_jobs(void);
+void   reconstruct_cmd(const CmdGroup *g, char *buf, size_t bufsz);
+
+/* ──────────────────────────────────────────────────────────
+ *  Signals  (signals.c)
+ * ────────────────────────────────────────────────────────── */
+void signal_init(void);
 
 /* ──────────────────────────────────────────────────────────
  *  Builtin: hop  (builtin_hop.c)
@@ -167,8 +196,24 @@ int builtin_reveal(char **args, int arg_count);
  *  Builtin: log  (builtin_log.c)
  * ────────────────────────────────────────────────────────── */
 int  builtin_log(char **args, int arg_count);
-void log_init(void);          /* load persistent history on shell start */
-void log_add(const char *cmd); /* add a command to the log             */
-void log_free(void);          /* free all history entries on exit       */
+void log_init(void);
+void log_add(const char *cmd);
+void log_free(void);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: activities  (builtin_activities.c)  — Part E.1
+ * ────────────────────────────────────────────────────────── */
+int builtin_activities(void);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: ping  (builtin_ping.c)  — Part E.2
+ * ────────────────────────────────────────────────────────── */
+int builtin_ping(char **args, int arg_count);
+
+/* ──────────────────────────────────────────────────────────
+ *  Builtin: fg / bg  (builtin_fg_bg.c)  — Part E.4
+ * ────────────────────────────────────────────────────────── */
+int builtin_fg(char **args, int arg_count);
+int builtin_bg(char **args, int arg_count);
 
 #endif /* SHELL_H */
