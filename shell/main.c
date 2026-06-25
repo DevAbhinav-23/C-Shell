@@ -1,8 +1,10 @@
 /*
- * main.c  --  Shell entry point (Parts A + B)
+ * main.c  --  Shell entry point (Parts A through E)
  *
  * The REPL loop: prompt -> read -> parse -> dispatch.
- * Builtin commands (hop, reveal, log) are handled internally.
+ * Builtin commands (hop, reveal, log, activities, ping, fg, bg)
+ * are handled internally. External commands use fork+execvp.
+ * Signal handling: Ctrl-C, Ctrl-D, Ctrl-Z (Part E.3).
  */
 #include "shell.h"
 #include "prompt.h"
@@ -10,6 +12,9 @@
 #include "lexer.h"
 #include "parser.h"
 #include "executor.h"
+#include "signals.h"
+#include <signal.h>
+#include <sys/wait.h>
 
 /* Global shell state */
 ShellState g_shell;
@@ -25,13 +30,17 @@ static void shell_init(void)
     }
     g_shell.prev_cwd[0] = '\0';
     g_shell.has_prev_cwd = 0;
+    g_shell.foreground_pgid = 0;
 
     /* Initialise the log / history subsystem */
     log_init();
 
-    /* Initialise background job tracking (Part D.2) */
+    /* Initialise background job tracking */
     g_shell.bg_job_count   = 0;
     g_shell.bg_next_job_id = 1;
+
+    /* Initialise signal handlers (Part E.3) */
+    signal_init();
 }
 
 /* ------------------------------------------------------------------ */
@@ -47,9 +56,25 @@ static int is_log_command(const ShellCmd *cmd)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Check if a command is a "meta" command that is handled inline      */
+/* ------------------------------------------------------------------ */
+static int is_meta_command(const char *name)
+{
+    return (name && (
+        strcmp(name, "activities") == 0 ||
+        strcmp(name, "ping") == 0 ||
+        strcmp(name, "fg") == 0 ||
+        strcmp(name, "bg") == 0));
+}
+
+/* ------------------------------------------------------------------ */
 /*  Execute a parsed ShellCmd                                          */
 /*                                                                     */
-/*  Part D: iterates over all cmd_groups.  The separators array tells   */
+/*  - Meta commands (activities, ping, fg, bg) are handled in parent.  */
+/*  - Builtin commands (hop, reveal, log) run in parent if no redirs.  */
+/*  - Everything else uses exec_cmd_group / exec_cmd_group_bg.         */
+/*                                                                     */
+/*  Part D: iterates over all cmd_groups.  The separators array tells  */
 /*  us how to run each group:                                          */
 /*      separators[i] == 0  →  sequential (;): wait for completion     */
 /*      separators[i] == 1  →  background (&): fork and don't wait     */
@@ -67,20 +92,32 @@ static int exec_cmd(ShellCmd *cmd)
     for (int i = 0; i < cmd->group_count; i++) {
         /* Determine if this group should run in background */
         int is_bg;
-        if (i < cmd->group_count - 1) {
-            /* There is a separator after this group */
+        if (i < cmd->group_count - 1)
             is_bg = cmd->separators[i];
-        } else {
-            /* Last group — check trailing & */
+        else
             is_bg = cmd->trailing_amp;
+
+        /* Check if it's a single meta/builtin command (handle in parent) */
+        CmdGroup *cg = &cmd->groups[i];
+        if (cg->command_count == 1 && cg->commands[0].name) {
+            const char *name = cg->commands[0].name;
+
+            if (is_meta_command(name) && !is_bg) {
+                if (strcmp(name, "activities") == 0)
+                    ret = builtin_activities();
+                else if (strcmp(name, "ping") == 0)
+                    ret = builtin_ping(cg->commands[0].args, cg->commands[0].arg_count);
+                else if (strcmp(name, "fg") == 0)
+                    ret = builtin_fg(cg->commands[0].args, cg->commands[0].arg_count);
+                else if (strcmp(name, "bg") == 0)
+                    ret = builtin_bg(cg->commands[0].args, cg->commands[0].arg_count);
+                continue;
+            }
         }
 
         if (is_bg) {
-            /* Background execution — fork and don't wait */
             exec_cmd_group_bg(&cmd->groups[i]);
         } else {
-            /* Sequential execution — wait for completion */
-            /* Continue even if the command fails (D.1 spec) */
             ret = exec_cmd_group(&cmd->groups[i]);
         }
     }
@@ -96,16 +133,23 @@ int main(void)
     shell_init();
 
     while (1) {
+        /* Reap any completed background jobs and handle SIGCHLD */
+        if (g_sigchld_received) {
+            g_sigchld_received = 0;
+            check_background_jobs();
+        }
+
         prompt_print();
 
         char *line = input_read_line();
         if (!line) {
-            /* EOF (Ctrl-D) */
-            printf("\n");
+            /* EOF (Ctrl-D): kill all children and print "logout" */
+            kill_all_children();
+            printf("logout\n");
             break;
         }
 
-        /* Check for completed background processes before parsing (D.2) */
+        /* Check for completed background processes (D.2) */
         check_background_jobs();
 
         /* Skip empty input */

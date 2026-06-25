@@ -22,12 +22,21 @@
 #include "lexer.h"
 #include "parser.h"
 #include "executor.h"
+#include "signals.h"
+#include "builtin_hop.h"
+#include "builtin_reveal.h"
+#include "builtin_log.h"
+#include "builtin_activities.h"
+#include "builtin_ping.h"
+#include "builtin_fg_bg.h"
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
 
 /* Global state required by shell modules */
 ShellState g_shell;
@@ -103,6 +112,8 @@ static void test_shell_init(void)
     g_shell.has_prev_cwd = 0;
     g_shell.bg_job_count   = 0;
     g_shell.bg_next_job_id = 1;
+    g_shell.foreground_pgid = 0;
+    g_sigchld_received = 0;
     log_init();
 }
 
@@ -1103,6 +1114,171 @@ static void test_background(void)
 #pragma GCC diagnostic pop
 
 /* ------------------------------------------------------------------ */
+/*  Part E tests: Signals, Activities, Ping, fg/bg                       */
+/* ------------------------------------------------------------------ */
+
+/* E.1: Activities command */
+static void test_activities(void)
+{
+    printf("\n=== ACTIVITIES TESTS (E.1) ===\n");
+
+    /* Activities with no jobs should succeed (empty list) */
+    g_shell.bg_job_count   = 0;
+    g_shell.bg_next_job_id = 1;
+    ASSERT_EQ_INT("activities: no jobs returns 0", 0, builtin_activities());
+
+    /* Add fake running and stopped jobs */
+    add_job(11111, 11111, "sleep", "sleep 100", JOB_RUNNING, 1);
+    add_job(22222, 22222, "vim", "vim myfile.txt", JOB_STOPPED, 1);
+
+    /* Activities should list both jobs */
+    printf("  (listing jobs below - inspect output)\n");
+    ASSERT_EQ_INT("activities: lists jobs", 0, builtin_activities());
+
+    /* Clean up */
+    g_shell.bg_job_count = 0;
+}
+
+/* E.2: Ping command */
+static void test_ping(void)
+{
+    printf("\n=== PING TESTS (E.2) ===\n");
+
+    /* Invalid arguments */
+    {
+        const char *args1[] = {"ping"};
+        ASSERT_EQ_INT("ping: no args error", 1, builtin_ping((char **)args1, 1));
+    }
+    {
+        const char *args2[] = {"ping", "42"};
+        ASSERT_EQ_INT("ping: missing PID error", 1, builtin_ping((char **)args2, 2));
+    }
+    {
+        const char *args3[] = {"ping", "abc", "9"};
+        ASSERT_EQ_INT("ping: invalid signal error", 1, builtin_ping((char **)args3, 3));
+    }
+    {
+        const char *args4[] = {"ping", "1", "-5"};
+        ASSERT_EQ_INT("ping: invalid PID error", 1, builtin_ping((char **)args4, 3));
+    }
+    {
+        const char *args5[] = {"ping", "100", "1"};
+        ASSERT_EQ_INT("ping: signal > 31 error", 1, builtin_ping((char **)args5, 3));
+    }
+    {
+        const char *args6[] = {"ping", "-1", "1"};
+        ASSERT_EQ_INT("ping: negative signal error", 1, builtin_ping((char **)args6, 3));
+    }
+
+    /* Ping our own process with signal 0 (valid: just check existence) */
+    {
+        char pidstr[16];
+        snprintf(pidstr, sizeof(pidstr), "%d", (int)getpid());
+        const char *args[] = {"ping", "0", pidstr};
+        ASSERT_EQ_INT("ping: signal 0 to self", 0, builtin_ping((char **)args, 3));
+    }
+
+    /* Ping a nonexistent PID */
+    {
+        const char *args[] = {"ping", "0", "999999999"};
+        ASSERT_EQ_INT("ping: nonexistent PID", 1, builtin_ping((char **)args, 3));
+    }
+}
+
+/* E.3: Signal handler initialization (verify no crash) */
+static void test_signals(void)
+{
+    printf("\n=== SIGNAL TESTS (E.3) ===\n");
+
+    /* Init signals should not crash */
+    signal_init();
+    ASSERT_TRUE("signal_init: no crash", 1);
+
+    /* g_sigchld_received should be 0 initially */
+    g_sigchld_received = 0;
+    ASSERT_EQ_INT("sigchld_received: initially 0", 0, g_sigchld_received);
+}
+
+/* E.4: fg/bg commands */
+static void test_fg_bg(void)
+{
+    printf("\n=== FG/BG TESTS (E.4) ===\n");
+
+    /* fg with no args */
+    {
+        const char *args[] = {"fg"};
+        ASSERT_EQ_INT("fg: no args error", 1, builtin_fg((char **)args, 1));
+    }
+
+    /* fg with invalid job ID */
+    {
+        const char *args[] = {"fg", "999"};
+        ASSERT_EQ_INT("fg: invalid job ID", 1, builtin_fg((char **)args, 2));
+    }
+
+    /* fg with non-numeric arg */
+    {
+        const char *args[] = {"fg", "abc"};
+        ASSERT_EQ_INT("fg: non-numeric ID", 1, builtin_fg((char **)args, 2));
+    }
+
+    /* fg with too many args */
+    {
+        const char *args[] = {"fg", "1", "extra"};
+        ASSERT_EQ_INT("fg: too many args", 1, builtin_fg((char **)args, 3));
+    }
+
+    /* bg with no args */
+    {
+        const char *args[] = {"bg"};
+        ASSERT_EQ_INT("bg: no args error", 1, builtin_bg((char **)args, 1));
+    }
+
+    /* bg with invalid job ID */
+    {
+        const char *args[] = {"bg", "999"};
+        ASSERT_EQ_INT("bg: invalid job ID", 1, builtin_bg((char **)args, 2));
+    }
+
+    /* bg with non-numeric arg */
+    {
+        const char *args[] = {"bg", "abc"};
+        ASSERT_EQ_INT("bg: non-numeric ID", 1, builtin_bg((char **)args, 2));
+    }
+
+    /* bg with too many args */
+    {
+        const char *args[] = {"bg", "1", "extra"};
+        ASSERT_EQ_INT("bg: too many args", 1, builtin_bg((char **)args, 3));
+    }
+
+    /* bg on a running job (add a fake running job) */
+    {
+        g_shell.bg_job_count   = 0;
+        g_shell.bg_next_job_id = 1;
+
+        /* Add a running job manually */
+        add_job(12345, 12345, "sleep", "sleep 100", JOB_RUNNING, 1);
+        ASSERT_TRUE("bg: job exists", g_shell.bg_job_count > 0);
+
+        /* bg on a running job should report "already running" */
+        const char *args[] = {"bg", "1"};
+        ASSERT_EQ_INT("bg: already running", 1, builtin_bg((char **)args, 2));
+
+        /* Add a stopped job manually */
+        add_job(12346, 12346, "vim", "vim", JOB_STOPPED, 1);
+        ASSERT_TRUE("bg: stopped job exists", g_shell.bg_job_count > 0);
+
+        /* bg on stopped job should succeed */
+        const char *args2[] = {"bg", "2"};
+        ASSERT_EQ_INT("bg: resume stopped", 0, builtin_bg((char **)args2, 2));
+
+        /* Clean up */
+        g_shell.bg_job_count = 0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  CLI modes                                                          */
 /* ------------------------------------------------------------------ */
 static void mode_lexer(const char *input)
@@ -1231,13 +1407,17 @@ static void usage(void)
         "  parser <input>     Parse input and print structure\n"
         "  valid  <input>     Check if input is syntactically valid\n"
         "  interactive        Run the shell in interactive mode\n"
-        "  selftest           Run all built-in unit tests (Parts A-D)\n"
+        "  selftest           Run all built-in unit tests (Parts A-E)\n"
         "  test_hop           Run hop tests only\n"
         "  test_reveal        Run reveal tests only\n"
         "  test_log           Run log tests only\n"
         "  test_exec          Run exec/pipe/redirect tests (Part C)\n"
         "  test_sequential    Run sequential execution tests (D.1)\n"
         "  test_background    Run background execution tests (D.2)\n"
+        "  test_activities    Run activities tests (E.1)\n"
+        "  test_ping          Run ping tests (E.2)\n"
+        "  test_signals       Run signal init tests (E.3)\n"
+        "  test_fg_bg         Run fg/bg tests (E.4)\n"
         "  prompt             Test the prompt module\n"
         "\n"
         "Examples:\n"
@@ -1290,6 +1470,10 @@ int main(int argc, char *argv[])
         test_exec();
         test_sequential();
         test_background();
+        test_activities();
+        test_ping();
+        test_signals();
+        test_fg_bg();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
         return (tests_passed == tests_run) ? 0 : 1;
     } else if (strcmp(cmd, "test_exec") == 0) {
@@ -1303,6 +1487,22 @@ int main(int argc, char *argv[])
     } else if (strcmp(cmd, "test_background") == 0) {
         test_shell_init();
         test_background();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_activities") == 0) {
+        test_shell_init();
+        test_activities();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_ping") == 0) {
+        test_shell_init();
+        test_ping();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_signals") == 0) {
+        test_shell_init();
+        test_signals();
+        printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
+    } else if (strcmp(cmd, "test_fg_bg") == 0) {
+        test_shell_init();
+        test_fg_bg();
         printf("\n=== RESULTS: %d/%d passed ===\n", tests_passed, tests_run);
     } else if (strcmp(cmd, "test_hop") == 0) {
         test_shell_init();

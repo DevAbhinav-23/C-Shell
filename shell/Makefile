@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────────────────
-#  Makefile for C-Shell  (Parts A + B)
+#  Makefile for C-Shell  (Parts A through E)
 #
 #  Targets:
 #    make all      – builds the shell binary (shell.out)
@@ -19,10 +19,12 @@ CFLAGS   = -std=c99 \
            -g
 
 # Source files for the shell
-SRCS     = main.c prompt.c input.c lexer.c parser.c utils.c executor.c \
-           builtin_hop.c builtin_reveal.c builtin_log.c
-HDRS     = shell.h prompt.h input.h lexer.h parser.h executor.h \
-           builtin_hop.h builtin_reveal.h builtin_log.h
+SRCS     = main.c prompt.c input.c lexer.c parser.c utils.c executor.c signals.c \
+           builtin_hop.c builtin_reveal.c builtin_log.c \
+           builtin_activities.c builtin_ping.c builtin_fg_bg.c
+HDRS     = shell.h prompt.h input.h lexer.h parser.h executor.h signals.h \
+           builtin_hop.h builtin_reveal.h builtin_log.h \
+           builtin_activities.h builtin_ping.h builtin_fg_bg.h
 OBJS     = $(SRCS:.c=.o)
 
 # ── Default target ──────────────────────────────────────────────────

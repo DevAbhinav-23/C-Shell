@@ -1,8 +1,10 @@
 /*
- * input.c  --  User input reading (A.2)
+ * input.c  --  User input reading (Part A + E.3)
  *
  * Reads a line from stdin using a dynamic buffer.
- * Returns NULL on EOF so the caller can exit gracefully.
+ * Returns NULL on EOF (Ctrl-D) so the caller can exit gracefully.
+ * Signal handlers use SA_RESTART, so fgetc is automatically restarted
+ * after SIGINT/SIGTSTP. No manual EINTR handling is needed.
  */
 #include "shell.h"
 
