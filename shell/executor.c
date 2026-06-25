@@ -1,5 +1,5 @@
 /*
- * executor.c  --  Command execution with pipes, redirects (Part C)
+ * executor.c  --  Command execution with pipes, redirects, jobs (Parts C + D + E)
  *
  * Handles:
  *   - External command execution (fork + execvp)
@@ -7,14 +7,16 @@
  *   - Output redirection (>, >>)
  *   - Command piping (|)
  *   - Combined redirects + pipes
- *
- * Builtin commands (hop, reveal, log) are still handled but run in child
- * processes when redirects or pipes are involved.
+ *   - Sequential execution (;)
+ *   - Background execution (&) with job tracking
+ *   - Process group management for Ctrl-C / Ctrl-Z (Part E)
  */
 #include "shell.h"
 #include "executor.h"
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
 
 /* ──────────────────────────────────────────────────────────
  *  Helpers
@@ -39,14 +41,136 @@ static int exec_builtin(const AtomicCmd *a)
 }
 
 /* ──────────────────────────────────────────────────────────
+ *  reconstruct_cmd  --  Reconstruct a command string from a CmdGroup
+ * ────────────────────────────────────────────────────────── */
+void reconstruct_cmd(const CmdGroup *g, char *buf, size_t bufsz)
+{
+    buf[0] = '\0';
+    for (int i = 0; i < g->command_count; i++) {
+        if (i > 0) {
+            strncat(buf, " | ", bufsz - strlen(buf) - 1);
+        }
+        const AtomicCmd *a = &g->commands[i];
+        if (a->name) {
+            strncat(buf, a->name, bufsz - strlen(buf) - 1);
+        }
+        for (int j = 1; j < a->arg_count; j++) {
+            strncat(buf, " ", bufsz - strlen(buf) - 1);
+            strncat(buf, a->args[j], bufsz - strlen(buf) - 1);
+        }
+        for (int j = 0; j < a->redirect_count; j++) {
+            const char *op = (a->redirects[j].type == REDIR_INPUT) ? " <" :
+                             (a->redirects[j].type == REDIR_OUTPUT) ? " >" : " >>";
+            strncat(buf, op, bufsz - strlen(buf) - 1);
+            strncat(buf, " ", bufsz - strlen(buf) - 1);
+            strncat(buf, a->redirects[j].filename, bufsz - strlen(buf) - 1);
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────────────────
+ *  Job management helpers
+ * ────────────────────────────────────────────────────────── */
+
+int add_job(pid_t pid, pid_t pgid, const char *cmd_name,
+            const char *full_cmd, JobState state, int is_bg)
+{
+    if (g_shell.bg_job_count >= SHELL_MAX_BG_JOBS) {
+        fprintf(stderr, "bg: job table full\n");
+        return -1;
+    }
+    BgJob *j = &g_shell.bg_jobs[g_shell.bg_job_count++];
+    j->pid    = pid;
+    j->pgid   = pgid;
+    j->job_id = g_shell.bg_next_job_id++;
+    j->state  = state;
+    j->is_bg  = is_bg;
+    strncpy(j->cmd_name, cmd_name ? cmd_name : "unknown", sizeof(j->cmd_name) - 1);
+    j->cmd_name[sizeof(j->cmd_name) - 1] = '\0';
+    strncpy(j->full_cmd, full_cmd ? full_cmd : "", sizeof(j->full_cmd) - 1);
+    j->full_cmd[sizeof(j->full_cmd) - 1] = '\0';
+    return j->job_id;
+}
+
+void remove_job_by_pid(pid_t pid)
+{
+    for (int i = 0; i < g_shell.bg_job_count; i++) {
+        if (g_shell.bg_jobs[i].pid == pid) {
+            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+            g_shell.bg_job_count--;
+            return;
+        }
+    }
+}
+
+BgJob *find_job_by_id(int job_id)
+{
+    for (int i = 0; i < g_shell.bg_job_count; i++) {
+        if (g_shell.bg_jobs[i].job_id == job_id)
+            return &g_shell.bg_jobs[i];
+    }
+    return NULL;
+}
+
+BgJob *find_job_by_pgid(pid_t pgid)
+{
+    for (int i = 0; i < g_shell.bg_job_count; i++) {
+        if (g_shell.bg_jobs[i].pgid == pgid)
+            return &g_shell.bg_jobs[i];
+    }
+    return NULL;
+}
+
+void cleanup_done_jobs(void)
+{
+    int i = 0;
+    while (i < g_shell.bg_job_count) {
+        BgJob *j = &g_shell.bg_jobs[i];
+        int status;
+        pid_t ret = waitpid(j->pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
+
+        if (ret == 0) {
+            i++;
+        } else if (ret < 0) {
+            /* Process gone — remove */
+            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+            g_shell.bg_job_count--;
+        } else {
+            if (WIFSTOPPED(status)) {
+                j->state = JOB_STOPPED;
+                i++;
+            } else if (WIFCONTINUED(status)) {
+                j->state = JOB_RUNNING;
+                i++;
+            } else {
+                /* Exited/killed — remove */
+                g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
+                g_shell.bg_job_count--;
+            }
+        }
+    }
+}
+
+void kill_all_children(void)
+{
+    for (int i = 0; i < g_shell.bg_job_count; i++) {
+        kill(g_shell.bg_jobs[i].pgid, SIGKILL);
+    }
+    g_shell.bg_job_count = 0;
+}
+
+/* ──────────────────────────────────────────────────────────
  *  run_atomic_in_child
  *
- *  Called AFTER fork().  Applies file redirects (pipe redirects
- *  already set up by caller), then runs the command (builtin or
- *  external).  Never returns — calls _exit() when done.
+ *  Called AFTER fork().  Sets up process group, applies file
+ *  redirects (pipe redirects already set up by caller), then
+ *  runs the command (builtin or external).  Never returns.
  * ────────────────────────────────────────────────────────── */
-static void run_atomic_in_child(const AtomicCmd *a)
+static void run_atomic_in_child(const AtomicCmd *a, pid_t pgid)
 {
+    /* Set up process group */
+    setpgid(0, pgid);
+
     if (!a->name)
         _exit(0);
 
@@ -86,7 +210,6 @@ static void run_atomic_in_child(const AtomicCmd *a)
         }
     }
 
-    /* Only the last redirect of each type takes effect */
     if (input_fd >= 0) {
         dup2(input_fd, STDIN_FILENO);
         close(input_fd);
@@ -102,17 +225,12 @@ static void run_atomic_in_child(const AtomicCmd *a)
 
     /* ── External command ────────────────────────────── */
     execvp(a->name, a->args);
-
-    /* If we get here, exec failed */
     fprintf(stderr, "Command not found!\n");
     _exit(1);
 }
 
 /* ──────────────────────────────────────────────────────────
  *  exec_cmd_group  --  Execute a command group (pipeline)
- *
- *  Handles pipes, file redirects, builtins, external commands.
- *  Returns the exit status of the last command in the pipeline.
  * ────────────────────────────────────────────────────────── */
 int exec_cmd_group(const CmdGroup *g)
 {
@@ -139,17 +257,47 @@ int exec_cmd_group(const CmdGroup *g)
             perror("fork");
             return 1;
         }
-        if (pid == 0)
-            run_atomic_in_child(a);  /* never returns */
+
+        pid_t pgid = pid;
+        if (pid == 0) {
+            run_atomic_in_child(a, pgid);  /* never returns */
+        }
+
+        /* Parent: set up process group */
+        setpgid(pid, pgid);
+        g_shell.foreground_pgid = pgid;
+
+        /* Reconstruct command string for job tracking */
+        char full_cmd[1024];
+        reconstruct_cmd(g, full_cmd, sizeof(full_cmd));
+        add_job(pid, pgid, a->name, full_cmd, JOB_RUNNING, 0);
 
         int status;
-        waitpid(pid, &status, 0);
+        waitpid(pid, &status, WUNTRACED | WCONTINUED);
+
+        /* Handle stop/continue */
+        if (WIFSTOPPED(status)) {
+            BgJob *job = find_job_by_pgid(pgid);
+            if (job) {
+                job->state = JOB_STOPPED;
+                printf("\n[%d] Stopped %s\n", job->job_id, job->cmd_name);
+            }
+            g_shell.foreground_pgid = 0;
+            return 0;
+        } else if (WIFCONTINUED(status)) {
+            /* Shouldn't happen for single-command fg */
+        } else {
+            remove_job_by_pid(pid);
+        }
+
+        g_shell.foreground_pgid = 0;
         return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     }
 
     /* ── Pipeline (2+ commands) ─────────────────────── */
     int   pipes[n - 1][2];
     pid_t pids[n];
+    pid_t pgid = 0;
 
     /* Create all pipes */
     for (int i = 0; i < n - 1; i++) {
@@ -170,8 +318,8 @@ int exec_cmd_group(const CmdGroup *g)
         pids[i] = fork();
         if (pids[i] < 0) {
             perror("fork");
-            /* Wait for already-forked children */
             for (int k = 0; k < i; k++) {
+                kill(pids[k], SIGTERM);
                 int st;
                 waitpid(pids[k], &st, 0);
             }
@@ -183,58 +331,85 @@ int exec_cmd_group(const CmdGroup *g)
         }
 
         if (pids[i] == 0) {
-            /* ── CHILD ───────────────────────────────── */
+            /* First child sets pgid for all */
+            if (i == 0)
+                pgid = getpid();
+            setpgid(0, pgid);
 
-            /* Wire up pipe input (read from previous command) */
+            /* Wire up pipe input */
             if (i > 0)
                 dup2(pipes[i - 1][0], STDIN_FILENO);
 
-            /* Wire up pipe output (write to next command) */
+            /* Wire up pipe output */
             if (i < n - 1)
                 dup2(pipes[i][1], STDOUT_FILENO);
 
-            /* Close ALL pipe fds in the child */
+            /* Close ALL pipe fds */
             for (int j = 0; j < n - 1; j++) {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
 
-            /* Apply file redirects and run command */
-            run_atomic_in_child(a);
+            run_atomic_in_child(a, pgid);
             /* never reaches here */
         }
     }
 
-    /* ── PARENT ──────────────────────────────────────── */
-    /* Close all pipe fds — the parent doesn't need them */
+    /* First child's pid becomes the pgid */
+    pgid = pids[0];
+
+    /* Parent: set all children into the same process group */
+    for (int i = 0; i < n; i++)
+        setpgid(pids[i], pgid);
+
+    /* Close all pipe fds in the parent */
     for (int i = 0; i < n - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
 
-    /* Wait for all children in order */
+    /* Set as foreground process group */
+    g_shell.foreground_pgid = pgid;
+
+    /* Reconstruct and track the pipeline */
+    char full_cmd[1024];
+    reconstruct_cmd(g, full_cmd, sizeof(full_cmd));
+    add_job(pids[0], pgid, g->commands[0].name, full_cmd, JOB_RUNNING, 0);
+
+    /* Wait for all children */
     int ret = 0;
     for (int i = 0; i < n; i++) {
         int status;
-        waitpid(pids[i], &status, 0);
-        if (i == n - 1)
-            ret = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        waitpid(pids[i], &status, WUNTRACED | WCONTINUED);
+
+        if (WIFSTOPPED(status) && i == n - 1) {
+            BgJob *job = find_job_by_pgid(pgid);
+            if (job) {
+                job->state = JOB_STOPPED;
+                printf("\n[%d] Stopped %s\n", job->job_id, job->cmd_name);
+            }
+        }
+        if (i == n - 1) {
+            if (WIFEXITED(status))
+                ret = WEXITSTATUS(status);
+            else
+                ret = 1;
+        }
     }
 
+    /* If nothing was stopped, remove the job (completed) */
+    {
+        BgJob *job = find_job_by_pgid(pgid);
+        if (job && job->state == JOB_RUNNING)
+            remove_job_by_pid(pids[0]);
+    }
+
+    g_shell.foreground_pgid = 0;
     return ret;
 }
 
 /* ──────────────────────────────────────────────────────────
  *  exec_cmd_group_bg  --  Execute a command group in background
- *
- *  Forks a child process to run the command group without waiting.
- *  The child's stdin is redirected to /dev/null so background
- *  processes do not read from the terminal.
- *
- *  Prints the background job number and PID in the format:
- *    [job_number] pid
- *
- *  Returns the job number (>= 1) on success, -1 on failure.
  * ────────────────────────────────────────────────────────── */
 int exec_cmd_group_bg(const CmdGroup *g)
 {
@@ -247,44 +422,38 @@ int exec_cmd_group_bg(const CmdGroup *g)
     if (pid == 0) {
         /* ── CHILD ───────────────────────────────────────── */
 
-        /* Redirect stdin to /dev/null (no terminal access) */
+        /* Separate process group so the shell isn't affected */
+        setpgid(0, 0);
+
+        /* Redirect stdin to /dev/null */
         int devnull = open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
             close(devnull);
         }
 
-        /* Separate process group so the shell isn't affected */
-        setpgid(0, 0);
+        /* Reset signal handlers to default for background child */
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
 
         /* Run the command group and exit with its status */
         _exit(exec_cmd_group(g));
     }
 
     /* ── PARENT ──────────────────────────────────────────── */
+    pid_t pgid = pid;
+    setpgid(pid, pgid);
 
-    /* Assign a job number */
-    int job_id = g_shell.bg_next_job_id++;
+    const char *name = (g->command_count > 0 && g->commands[0].name)
+                           ? g->commands[0].name : "unknown";
 
-    /* Record the job */
-    if (g_shell.bg_job_count < SHELL_MAX_BG_JOBS) {
-        BgJob *j = &g_shell.bg_jobs[g_shell.bg_job_count++];
-        j->pid    = pid;
-        j->job_id = job_id;
-        j->running = 1;
+    char full_cmd[1024];
+    reconstruct_cmd(g, full_cmd, sizeof(full_cmd));
 
-        /* Extract the first command name for later reporting */
-        const char *name = (g->command_count > 0 && g->commands[0].name)
-                               ? g->commands[0].name : "unknown";
-        strncpy(j->cmd_name, name, sizeof(j->cmd_name) - 1);
-        j->cmd_name[sizeof(j->cmd_name) - 1] = '\0';
-    } else {
-        fprintf(stderr, "bg: job table full, %s (pid %d) not tracked\n",
-                g->command_count > 0 && g->commands[0].name
-                    ? g->commands[0].name : "unknown", (int)pid);
-    }
+    int job_id = add_job(pid, pgid, name, full_cmd, JOB_RUNNING, 1);
+    if (job_id < 0)
+        return -1;
 
-    /* Print the background notification */
     printf("[%d] %d\n", job_id, (int)pid);
     fflush(stdout);
 
@@ -293,15 +462,6 @@ int exec_cmd_group_bg(const CmdGroup *g)
 
 /* ──────────────────────────────────────────────────────────
  *  check_background_jobs  --  Reap and report completed bg jobs
- *
- *  Called after reading user input (before parsing).  Uses
- *  waitpid(WNOHANG) to check every tracked background process.
- *  When a process has completed prints:
- *      command_name with pid process_id exited normally
- *  or
- *      command_name with pid process_id exited abnormally
- *
- *  Completed jobs are removed from the tracking array.
  * ────────────────────────────────────────────────────────── */
 void check_background_jobs(void)
 {
@@ -309,20 +469,10 @@ void check_background_jobs(void)
     while (i < g_shell.bg_job_count) {
         BgJob *j = &g_shell.bg_jobs[i];
 
-        if (!j->running) {
-            /* Already handled — remove by shifting */
-            g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
-            g_shell.bg_job_count--;
-            continue;
-        }
-
         int status;
-        pid_t ret = waitpid(j->pid, &status, WNOHANG);
+        pid_t ret = waitpid(j->pid, &status, WNOHANG | WCONTINUED);
 
         if (ret == j->pid) {
-            /* Process has completed */
-            j->running = 0;
-
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                 printf("%s with pid %d exited normally\n",
                        j->cmd_name, (int)j->pid);
@@ -332,20 +482,12 @@ void check_background_jobs(void)
             }
             fflush(stdout);
 
-            /* Remove this entry by swapping with the last */
             g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
             g_shell.bg_job_count--;
-            /* Don't advance i — we swapped in a new entry to check */
         } else if (ret == 0) {
-            /* Still running */
             i++;
         } else {
-            /* waitpid error (ECHILD etc.) — treat as completed */
-            j->running = 0;
-            printf("%s with pid %d exited abnormally\n",
-                   j->cmd_name, (int)j->pid);
-            fflush(stdout);
-
+            /* waitpid error — treat as completed */
             g_shell.bg_jobs[i] = g_shell.bg_jobs[g_shell.bg_job_count - 1];
             g_shell.bg_job_count--;
         }
